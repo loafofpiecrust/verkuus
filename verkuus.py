@@ -50,71 +50,68 @@ class ChangeableStream(Stream):
     while True:
       yield next(self._data)
 
-### Virtual keyboard that produces sounds from
+### Virtual keyboard that produces sounds from finger gestures.
 class Keyboard(Leap.Listener):
-    finger_names = ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky']
-    bone_names = ['Metacarpal', 'Proximal', 'Intermediate', 'Distal']
-
-    curr_y = 0
-    key_shift = 1
+    key_shift = 1 # Multiplier for the octave our keyboard starts at.
     mix = Streamix(True)
     streams = {}
     player = AudioIO(api=None)
-    fingers_down = {}
-    mutex = Lock()
+    fingers_down = {} # Map of fingers down: {(is_left?, finger_idx): is_down?}
+    mutex = Lock() # Use to sync our audio synthesis in case we run in multiple threads.
     attack = 100 * ms # How long a note fades in
     release = 450 * ms # How long a note plays after release
     level = .5  # Highest amplitude value per note
 
+    ### Called when our sensor is ready.
     def on_init(self, controller):
         print "Initialized"
         self.player.play(self.mix, rate=rate)
 
+    ### (Re)Connected to the sensor.
     def on_connect(self, controller):
         print "Connected"
-        #controller.enable_gesture(Leap.Gesture.TYPE_KEY_TAP)
-        controller.enable_gesture(Leap.Gesture.TYPE_CIRCLE)
 
+    ### Disconnected from the sensor.
     def on_disconnect(self, controller):
-        # Note: not dispatched when running in a debugger.
+        # NOTE: not dispatched when running in a debugger.
         print "Disconnected"
 
     def on_exit(self, controller):
         print "Exited"
 
-    def pluck_string(self, freq, synth, speed):
+
+    def play_sound(self, freq, synth):
         self.mutex.acquire()
-        #freq = round_note(freq)
-        level = 0.5
-        freq_str = str(freq)
-        freq = self.key_shift * freq
+        freq_str = str(freq) # Dict seems to need non-int keys to work right.
+        freq *= self.key_shift
         if not freq_str in self.streams:
-            # Prepares the synth
-            #freq = notes[ch]
+            ## Prepare the synth
             cs = ChangeableStream(self.level)
             env = line(self.attack, 0, self.level).append(cs)
             snd = env * synth(freq * Hz, tau=800*ms)
-            # Mix it, storing the ChangeableStream to be changed afterwards
+            ## Mix it, storing the stream to destroy later.
             self.streams[freq_str] = {'stream': cs, 'count': 1}
-            print "playing freq %s" % (freq)
             self.mix.add(0, snd)
+            print "playing freq %s" % (freq)
         else:
             entry = self.streams[freq_str]
             entry['count'] += 1
         self.mutex.release()
 
+    def end_stream(self, s):
+        s['stream'].limit(0).append(line(self.release, self.level, 0))
 
     def stop_sound(self, freq):
         self.mutex.acquire()
-        #ch = evt.char
-        #freq = round_note(freq)
         freq_str = str(freq)
         if freq_str in self.streams:
             entry = self.streams[freq_str]
+            ## Basic reference counting
             if entry['count'] > 1:
                 entry['count'] -= 1
             else:
-                entry['stream'].limit(0).append(line(self.release, self.level, 0))
+                ## We've lifted the last finger on this key, so stop the sound.
+                self.end_stream(entry['stream'])
                 del self.streams[freq_str]
         self.mutex.release()
 
@@ -122,79 +119,77 @@ class Keyboard(Leap.Listener):
     def on_frame(self, controller):
         used_freq = 0
         used_idx = 0
-        # Get the most recent frame and report some basic information
+        ## Get the most recent frame and report some basic information
         frame = controller.frame()
 
-
+        ## If we take away both hands, clear out all possibly pressed keys.
         if len(frame.hands) == 0:
             self.mutex.acquire()
             for k, s in self.streams.iteritems():
-                s['stream'].limit(0).append(line(self.release, self.level, 0))
+                self.end_stream(s['stream'])
             self.streams.clear()
             self.mutex.release()
+
+        ## Check out one or both of our hands
         for hand in frame.hands:
+            ## Skip this hand if the sensor isn't super confident about the fingers.
             if hand.confidence < 0.9:
                 print "hand confidence = %f" % (hand.confidence)
                 continue
 
-            if hand.grab_strength > 0.95:
-                # look for twist gestures
-                # this signals us to look for twisting
+            if hand.grab_strength > 0.95: # This hand is in a fist
+                ## Look for twist gestures
                 rot_dist = hand.rotation_angle(controller.frame(1), Leap.Vector.z_axis)
                 if abs(rot_dist) > 0.06:
-                    print "fist rotation: %s" % (rot_dist)
+                    ## Shift our key by some amount based on the twisting.
+                    ## To be detected, the twisting has to happen pretty quick.
                     self.key_shift += rot_dist / 3
 
+            ## This hand has fingers.
             for finger in hand.fingers:
                 if finger.type >= 0:
                     knuckle = finger.bone(2)
                     fingertip = finger.bone(3)
-                    key_y = 20
-                    key_height = 15
-                    tip_pos = fingertip.center
-                    hand_pos = hand.palm_position
-                    finger_diff_y = abs(hand_pos.y - tip_pos.y)
+                    finger_diff_y = abs(hand.palm_position.y - fingertip.center.y)
                     finger_key = (hand.is_left, finger.type)
-                    hand_x = hand.palm_position.x
                     key_freq = knuckle.center.x
-                    min_dist = 30
-                    min_angle = 5.0
-                    norm_diff = 0.2
+                    min_thumb_dist = 25
+                    norm_diff = 0.2 # The threshold of curl for a finger to press a key.
 
-                    if finger_key in self.fingers_down and ((finger.type is 0 and finger_diff_y > min_dist) or knuckle.direction.y <= norm_diff+0.03):
+                    ## This finger is lifting from a key.
+                    if finger_key in self.fingers_down and ((finger.type is 0 and finger_diff_y > min_thumb_dist) or knuckle.direction.y <= norm_diff+0.03):
                         self.stop_sound(self.fingers_down[finger_key])
                         del self.fingers_down[finger_key]
-                    elif ((finger.type is 0 and finger_diff_y <= min_dist) or knuckle.direction.y > norm_diff) and finger.tip_velocity.y < -300 and not finger_key in self.fingers_down:
+                    ## The finger is starting to press a key.
+                    elif ((finger.type is 0 and finger_diff_y <= min_thumb_dist) or knuckle.direction.y > norm_diff) and finger.tip_velocity.y < -300 and not finger_key in self.fingers_down:
                         ## If another finger played a note, play the right adjacent note.
                         if used_freq != 0:
                             key_freq = round_note(used_freq + 20 * (finger.type - used_idx))
                         else:
                             used_freq = key_freq
 
-                        fingertip = finger.bone(3)
-                        tip_dir = fingertip.direction
-                        self.curr_y = tip_dir.y
+                        ## Left hand should play more of the bass end.
                         if hand.is_left:
                             key_freq -= 100
                         key_freq = round_note(key_freq)
-                        self.pluck_string(key_freq, karplus_strong, finger.tip_velocity.magnitude)
+                        self.play_sound(key_freq, karplus_strong)
                         self.fingers_down[finger_key] = key_freq
 
 
 def main():
-
-    # Create a sample listener and controller
+    # Create a keyboard and sensor controller
     listener = Keyboard()
     controller = Leap.Controller()
 
-    # Have the sample listener receive events from the controller
-    #controller.add_listener(listener)
+    ## Have the listener receive events from the controller
     listener.on_init(controller)
     while 1:
         listener.on_frame(controller)
-        time.sleep(0.025)
+        time.sleep(0.025) # Don't suck up CPU time.
 
-    # TODO: Exit with a key rather than Ctrl+C in console.
+    ## TODO: Exit with a key rather than Ctrl+C in console.
+    ## This below runs multithreaded, so doesn't work as well with audio synthesis.
+    ## controller.add_listener(listener)
 
 
 
