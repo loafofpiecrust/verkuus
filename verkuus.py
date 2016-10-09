@@ -99,7 +99,7 @@ class Keyboard(Leap.Listener):
         self.mutex.release()
 
     def end_stream(self, s):
-        s['stream'].limit(0).append(line(self.release, self.level, 0))
+        s.limit(0).append(line(self.release, self.level, 0))
 
     def stop_sound(self, freq):
         self.mutex.acquire()
@@ -152,7 +152,7 @@ class Keyboard(Leap.Listener):
                     fingertip = finger.bone(3)
                     finger_diff_y = abs(hand.palm_position.y - fingertip.center.y)
                     finger_key = (hand.is_left, finger.type)
-                    key_freq = knuckle.center.x
+                    key_freq = knuckle.center.x + 260
                     min_thumb_dist = 25
                     norm_diff = 0.2 # The threshold of curl for a finger to press a key.
 
